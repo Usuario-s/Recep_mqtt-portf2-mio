@@ -3,7 +3,6 @@ import streamlit as st
 import paho.mqtt.client as mqtt
 import json
 import time
-import uuid
 import threading
 import html
 from datetime import datetime
@@ -30,7 +29,6 @@ st.markdown("""
 :root {
     --bg: #0D1117;
     --panel: #161B22;
-    --panel-light: #1C2128;
     --border: #30363D;
     --text: #E6EDF3;
     --muted: #8B949E;
@@ -246,11 +244,6 @@ hr {
     font-weight: 600;
 }
 
-.status-yellow {
-    color: #D29922;
-    font-weight: 600;
-}
-
 .status-red {
     color: #F85149;
     font-weight: 600;
@@ -305,24 +298,19 @@ if "last_read_time" not in st.session_state:
 
 
 # =========================================================
-# COMPATIBILIDAD CON PAHO-MQTT
+# CREAR CLIENTE MQTT
 # =========================================================
 
 def create_mqtt_client(client_id):
-    """
-    Crea un cliente compatible con distintas versiones
-    de paho-mqtt.
-    """
+    """Compatible con paho-mqtt 1.x y 2.x."""
 
     try:
-        # API utilizada por paho-mqtt 2.x
         return mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
             client_id=client_id,
             protocol=mqtt.MQTTv311
         )
     except (AttributeError, TypeError):
-        # Compatibilidad con versiones anteriores
         return mqtt.Client(
             client_id=client_id,
             protocol=mqtt.MQTTv311
@@ -334,74 +322,71 @@ def create_mqtt_client(client_id):
 # =========================================================
 
 def get_mqtt_message(broker, port, topic, client_id, timeout=8):
-    """
-    Se conecta al broker, se suscribe al tópico y espera
-    un mensaje hasta alcanzar el tiempo límite.
-    """
+    """Conecta, se suscribe y espera un mensaje MQTT."""
 
-    message_event = threading.Event()
     result = {
         "received": False,
         "payload": None,
-        "error": None
+        "error": None,
+        "subscribed": False
     }
 
+    message_event = threading.Event()
     client = None
 
     def on_connect(client, userdata, flags, rc, *extra):
-        # En MQTT 3.1.1, rc == 0 significa conexión exitosa.
         try:
-            if hasattr(rc, "value"):
-                connection_code = rc.value
-            else:
-                connection_code = int(rc)
+            code = rc.value if hasattr(rc, "value") else int(rc)
 
-            if connection_code != 0:
+            if code != 0:
                 result["error"] = (
-                    f"El broker rechazó la conexión. Código: "
-                    f"{connection_code}"
+                    f"El broker rechazó la conexión. Código: {code}"
                 )
                 message_event.set()
                 return
 
-            client.subscribe(topic, qos=0)
+            subscribe_result, _ = client.subscribe(topic, qos=0)
+
+            if subscribe_result != mqtt.MQTT_ERR_SUCCESS:
+                result["error"] = (
+                    "No se pudo enviar la solicitud de suscripción."
+                )
+                message_event.set()
 
         except Exception as exc:
-            result["error"] = f"Error al suscribirse: {exc}"
+            result["error"] = f"Error de suscripción: {exc}"
             message_event.set()
 
     def on_subscribe(client, userdata, mid, granted_qos, *extra):
-        # La suscripción se confirma desde el callback.
-        pass
+        result["subscribed"] = True
 
     def on_message(client, userdata, message):
         try:
-            raw_payload = message.payload.decode("utf-8")
-        except UnicodeDecodeError:
             raw_payload = message.payload.decode(
                 "utf-8",
                 errors="replace"
             )
 
-        try:
-            payload = json.loads(raw_payload)
-        except (json.JSONDecodeError, TypeError):
-            payload = raw_payload
+            try:
+                payload = json.loads(raw_payload)
+            except (json.JSONDecodeError, TypeError):
+                payload = raw_payload
 
-        result["payload"] = payload
-        result["received"] = True
-        message_event.set()
+            result["payload"] = payload
+            result["received"] = True
 
-    def on_disconnect(client, userdata, *args):
-        # Evita marcar como error una desconexión normal
-        # después de recibir el mensaje.
-        if not result["received"] and not result["error"]:
-            pass
+        except Exception as exc:
+            result["error"] = f"Error al procesar el mensaje: {exc}"
+
+        finally:
+            message_event.set()
 
     try:
-        broker = broker.strip()
-        topic = topic.strip()
-        client_id = client_id.strip()
+        broker = str(broker).strip()
+        topic = str(topic).strip()
+        client_id = str(client_id).strip()
+        port = int(port)
+        timeout = max(1, int(timeout))
 
         if not broker:
             return {"error": "La dirección del broker está vacía."}
@@ -412,8 +397,6 @@ def get_mqtt_message(broker, port, topic, client_id, timeout=8):
         if not client_id:
             return {"error": "El ID del cliente está vacío."}
 
-        port = int(port)
-
         if not 1 <= port <= 65535:
             return {"error": "El puerto debe estar entre 1 y 65535."}
 
@@ -422,45 +405,49 @@ def get_mqtt_message(broker, port, topic, client_id, timeout=8):
         client.on_connect = on_connect
         client.on_message = on_message
         client.on_subscribe = on_subscribe
-        client.on_disconnect = on_disconnect
 
         client.connect(broker, port, keepalive=30)
         client.loop_start()
 
-        # Espera la llegada del mensaje o un error de conexión.
+        # Esperar el mensaje o el error de conexión.
         message_event.wait(timeout)
 
         if result["error"]:
             return {"error": result["error"]}
 
-        if not result["received"]:
+        if result["received"]:
+            return result["payload"]
+
+        if not result["subscribed"]:
             return {
                 "error": (
-                    f"Tiempo de espera agotado ({timeout} segundos). "
-                    "No llegó ningún mensaje al tópico indicado. "
-                    "Verifica que otro dispositivo esté publicando "
-                    "datos en ese mismo tópico."
+                    "No se confirmó la suscripción al tópico. "
+                    "Comprueba el broker, el puerto y el tópico."
                 )
             }
 
-        return result["payload"]
+        return {
+            "error": (
+                f"Tiempo de espera agotado ({timeout} segundos). "
+                "La suscripción se realizó, pero no llegó ningún mensaje. "
+                "Comprueba que otro dispositivo publique datos en ese tópico."
+            )
+        }
 
     except Exception as exc:
         return {
-            "error": (
-                f"{type(exc).__name__}: {str(exc)}"
-            )
+            "error": f"{type(exc).__name__}: {str(exc)}"
         }
 
     finally:
         if client is not None:
             try:
-                client.loop_stop()
+                client.disconnect()
             except Exception:
                 pass
 
             try:
-                client.disconnect()
+                client.loop_stop()
             except Exception:
                 pass
 
@@ -505,7 +492,7 @@ with st.sidebar:
     client_id = st.text_input(
         "client_id",
         value="streamlit_client",
-        help="Identificador único del cliente MQTT"
+        help="Usa un identificador único para cada cliente conectado"
     )
 
     timeout = st.number_input(
@@ -520,19 +507,20 @@ with st.sidebar:
     st.markdown("---")
 
     st.markdown(
-        '<div style="font-family:Fira Code,monospace;'
-        'font-size:12px;color:#8B949E;line-height:2;">'
-        '<span style="color:#79C0FF;">PROTOCOL</span> MQTT<br>'
-        '<span style="color:#79C0FF;">FORMAT</span> JSON / TEXT<br>'
-        '<span style="color:#79C0FF;">TIMEOUT</span> '
-        + str(int(timeout)) + ' seconds'
-        + '</div>',
+        f"""
+        <div style="font-family:Fira Code,monospace;
+                    font-size:12px;color:#8B949E;line-height:2;">
+            <span style="color:#79C0FF;">PROTOCOL</span> MQTT<br>
+            <span style="color:#79C0FF;">FORMAT</span> JSON / TEXT<br>
+            <span style="color:#79C0FF;">TIMEOUT</span> {int(timeout)} seconds
+        </div>
+        """,
         unsafe_allow_html=True
     )
 
 
 # =========================================================
-# ENCABEZADO
+# ENCABEZADO: HTML SIN COMILLAS TRIPLES INTERNAS
 # =========================================================
 
 st.markdown("""
@@ -548,9 +536,8 @@ st.markdown("""
     <div class="code-comment">
         <span class="syntax-purple">class</span>
         <span class="syntax-green"> SensorMonitor</span>:<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;<span class="syntax-blue">"""</span>
-        Receive and inspect sensor messages.
-        <span class="syntax-blue">"""</span><br>
+        &nbsp;&nbsp;&nbsp;&nbsp;<span class="syntax-blue">docstring</span> =
+        <span class="syntax-orange">"Receive and inspect sensor messages."</span><br>
         &nbsp;&nbsp;&nbsp;&nbsp;protocol = <span class="syntax-orange">"MQTT"</span><br>
         &nbsp;&nbsp;&nbsp;&nbsp;data_format = <span class="syntax-orange">"JSON / TEXT"</span>
     </div>
@@ -563,7 +550,6 @@ st.markdown("""
 # =========================================================
 
 with st.expander("README.md  |  Instrucciones de uso"):
-
     st.markdown("""
     **Descripción**
 
@@ -574,7 +560,7 @@ with st.expander("README.md  |  Instrucciones de uso"):
     1. Define la dirección del broker.
     2. Selecciona el puerto MQTT.
     3. Introduce el tópico de suscripción.
-    4. Define un ID de cliente.
+    4. Define un ID de cliente único.
     5. Ejecuta la lectura para esperar un mensaje.
 
     **Brokers públicos de prueba**
@@ -583,8 +569,7 @@ with st.expander("README.md  |  Instrucciones de uso"):
     - `test.mosquitto.org`
     - `broker.hivemq.com`
 
-    **Importante:** otro dispositivo debe publicar datos en el mismo tópico.
-    Conectarse al broker no garantiza que exista un mensaje disponible.
+    **Importante:** otro dispositivo debe publicar datos en el tópico exacto.
     """)
 
 
@@ -592,8 +577,6 @@ with st.expander("README.md  |  Instrucciones de uso"):
 # ESTADO DE CONEXIÓN
 # =========================================================
 
-# Escapar el contenido del usuario para evitar que caracteres
-# HTML en el broker o tópico rompan la interfaz.
 safe_broker = html.escape(str(broker))
 safe_topic = html.escape(str(topic))
 
@@ -626,22 +609,14 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-if st.button(
-    "▶  EJECUTAR LECTURA",
-    use_container_width=True
-):
+if st.button("▶  EJECUTAR LECTURA", use_container_width=True):
     if not broker.strip() or not topic.strip() or not client_id.strip():
         st.session_state.sensor_data = {
             "error": "El broker, el tópico y el ID del cliente son obligatorios."
         }
-        st.session_state.last_read_time = datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
     else:
-        with st.spinner(
-            "Conectando al broker MQTT y esperando datos..."
-        ):
-            sensor_data = get_mqtt_message(
+        with st.spinner("Conectando al broker MQTT y esperando datos..."):
+            st.session_state.sensor_data = get_mqtt_message(
                 broker=broker,
                 port=int(port),
                 topic=topic,
@@ -649,10 +624,9 @@ if st.button(
                 timeout=int(timeout)
             )
 
-            st.session_state.sensor_data = sensor_data
-            st.session_state.last_read_time = datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+    st.session_state.last_read_time = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
 # =========================================================
@@ -660,14 +634,12 @@ if st.button(
 # =========================================================
 
 if st.session_state.sensor_data is not None:
-
     st.markdown("---")
     st.markdown("### `02` — Output / Sensor data")
 
     data = st.session_state.sensor_data
 
     if isinstance(data, dict) and "error" in data:
-
         st.error(f"CONNECTION_ERROR: {data['error']}")
 
         st.markdown(
@@ -679,7 +651,6 @@ if st.session_state.sensor_data is not None:
         )
 
     else:
-
         st.markdown(
             '<div class="status-bar">'
             '<span class="status-green">● MESSAGE_RECEIVED</span>'
@@ -689,21 +660,15 @@ if st.session_state.sensor_data is not None:
         )
 
         if st.session_state.last_read_time:
-            st.caption(
-                "Timestamp: "
-                + st.session_state.last_read_time
-            )
+            st.caption("Timestamp: " + st.session_state.last_read_time)
 
         if isinstance(data, dict):
-
             st.markdown("#### `payload`")
 
             items = list(data.items())
 
             if not items:
-                st.info(
-                    "El mensaje recibido es un objeto JSON vacío: {}"
-                )
+                st.info("El mensaje recibido es un objeto JSON vacío: {}")
 
             for start in range(0, len(items), 3):
                 group = items[start:start + 3]
@@ -717,8 +682,6 @@ if st.session_state.sensor_data is not None:
                         )
                     elif value is None:
                         display_value = "null"
-                    elif isinstance(value, bool):
-                        display_value = str(value)
                     else:
                         display_value = str(value)
 
@@ -743,7 +706,6 @@ if st.session_state.sensor_data is not None:
                 )
 
         elif isinstance(data, list):
-
             st.markdown("#### `payload.array`")
             st.json(data)
 
@@ -759,7 +721,6 @@ if st.session_state.sensor_data is not None:
                 )
 
         else:
-
             st.markdown("#### `payload.text`")
             st.code(str(data), language="text")
 
@@ -770,7 +731,7 @@ if st.session_state.sensor_data is not None:
 
 st.markdown("""
 <div class="footer">
-    MQTT SENSOR READER // IOT DEBUGGING CONSOLE // v1.1
+    MQTT SENSOR READER // IOT DEBUGGING CONSOLE // v1.2
 </div>
 """, unsafe_allow_html=True)
 
