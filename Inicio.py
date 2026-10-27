@@ -3,7 +3,10 @@ import streamlit as st
 import paho.mqtt.client as mqtt
 import json
 import time
-
+import uuid
+import threading
+import html
+from datetime import datetime
 
 # =========================================================
 # CONFIGURACIÓN DE LA PÁGINA
@@ -15,7 +18,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
 
 # =========================================================
 # ESTILOS: TERMINAL / IDE
@@ -51,8 +53,6 @@ st.markdown("""
     padding-bottom: 3rem;
 }
 
-/* Tipografía general */
-
 h1, h2, h3, h4 {
     color: var(--text) !important;
     font-family: 'Fira Code', monospace !important;
@@ -61,8 +61,6 @@ h1, h2, h3, h4 {
 p, label, .stMarkdown {
     color: var(--text);
 }
-
-/* Encabezado estilo archivo de código */
 
 .editor-header {
     background: #161B22;
@@ -94,6 +92,7 @@ p, label, .stMarkdown {
     border-top: none;
     border-radius: 0 0 10px 10px;
     padding: 24px;
+    overflow-wrap: anywhere;
 }
 
 .code-title {
@@ -109,25 +108,13 @@ p, label, .stMarkdown {
     font-family: 'Fira Code', monospace;
     font-size: 13px;
     line-height: 1.9;
+    overflow-wrap: anywhere;
 }
 
-.syntax-green {
-    color: #7EE787;
-}
-
-.syntax-blue {
-    color: #79C0FF;
-}
-
-.syntax-purple {
-    color: #D2A8FF;
-}
-
-.syntax-orange {
-    color: #FFA657;
-}
-
-/* Barra lateral */
+.syntax-green { color: #7EE787; }
+.syntax-blue { color: #79C0FF; }
+.syntax-purple { color: #D2A8FF; }
+.syntax-orange { color: #FFA657; }
 
 section[data-testid="stSidebar"] {
     background: #0D1117;
@@ -144,8 +131,6 @@ section[data-testid="stSidebar"] h3 {
 section[data-testid="stSidebar"] p {
     color: #C9D1D9 !important;
 }
-
-/* Inputs */
 
 .stTextInput input,
 .stNumberInput input {
@@ -169,8 +154,6 @@ section[data-testid="stSidebar"] p {
     font-size: 12px !important;
 }
 
-/* Botones */
-
 .stButton > button {
     background: #238636;
     color: #FFFFFF !important;
@@ -192,8 +175,6 @@ section[data-testid="stSidebar"] p {
     box-shadow: 0 0 0 2px #58A6FF !important;
 }
 
-/* Contenedores */
-
 div[data-testid="stVerticalBlockBorderWrapper"] {
     background: #161B22;
     border: 1px solid #30363D;
@@ -201,19 +182,19 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     padding: 14px;
 }
 
-/* Métricas */
-
 div[data-testid="stMetric"] {
     background: #0D1117;
     border: 1px solid #30363D;
     border-radius: 7px;
     padding: 15px;
+    min-width: 0;
 }
 
 div[data-testid="stMetricLabel"] {
     color: #8B949E !important;
     font-family: 'Fira Code', monospace;
     font-size: 12px;
+    overflow-wrap: anywhere;
 }
 
 div[data-testid="stMetricValue"] {
@@ -222,8 +203,6 @@ div[data-testid="stMetricValue"] {
     font-size: 23px;
     overflow-wrap: anywhere;
 }
-
-/* Expanders */
 
 div[data-testid="stExpander"] {
     background: #161B22;
@@ -236,13 +215,9 @@ div[data-testid="stExpander"] summary {
     font-family: 'Fira Code', monospace;
 }
 
-/* Alertas */
-
 div[data-testid="stAlert"] {
     border-radius: 6px;
 }
-
-/* JSON y bloques de código */
 
 div[data-testid="stJson"],
 .stCode {
@@ -250,13 +225,9 @@ div[data-testid="stJson"],
     border-radius: 7px;
 }
 
-/* Separadores */
-
 hr {
     border-color: #30363D !important;
 }
-
-/* Barra de estado */
 
 .status-bar {
     background: #161B22;
@@ -267,6 +238,7 @@ hr {
     font-size: 12px;
     color: #8B949E;
     margin: 16px 0 22px 0;
+    overflow-wrap: anywhere;
 }
 
 .status-green {
@@ -279,7 +251,10 @@ hr {
     font-weight: 600;
 }
 
-/* Pie */
+.status-red {
+    color: #F85149;
+    font-weight: 600;
+}
 
 .footer {
     color: #6E7681;
@@ -302,76 +277,192 @@ footer {
 header[data-testid="stHeader"] {
     background: transparent;
 }
+
+@media (max-width: 640px) {
+    .block-container {
+        padding-top: 1rem;
+        padding-left: 1rem;
+        padding-right: 1rem;
+    }
+
+    .editor-content {
+        padding: 15px;
+    }
+}
 </style>
 """, unsafe_allow_html=True)
 
 
 # =========================================================
-# VARIABLES DE ESTADO
+# ESTADO DE LA APLICACIÓN
 # =========================================================
 
 if "sensor_data" not in st.session_state:
     st.session_state.sensor_data = None
+
+if "last_read_time" not in st.session_state:
+    st.session_state.last_read_time = None
+
+
+# =========================================================
+# COMPATIBILIDAD CON PAHO-MQTT
+# =========================================================
+
+def create_mqtt_client(client_id):
+    """
+    Crea un cliente compatible con distintas versiones
+    de paho-mqtt.
+    """
+
+    try:
+        # API utilizada por paho-mqtt 2.x
+        return mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
+            client_id=client_id,
+            protocol=mqtt.MQTTv311
+        )
+    except (AttributeError, TypeError):
+        # Compatibilidad con versiones anteriores
+        return mqtt.Client(
+            client_id=client_id,
+            protocol=mqtt.MQTTv311
+        )
 
 
 # =========================================================
 # FUNCIÓN MQTT
 # =========================================================
 
-def get_mqtt_message(broker, port, topic, client_id):
-    """Obtiene un mensaje MQTT dentro de un tiempo límite."""
+def get_mqtt_message(broker, port, topic, client_id, timeout=8):
+    """
+    Se conecta al broker, se suscribe al tópico y espera
+    un mensaje hasta alcanzar el tiempo límite.
+    """
 
-    message_received = {
+    message_event = threading.Event()
+    result = {
         "received": False,
-        "payload": None
+        "payload": None,
+        "error": None
     }
-
-    def on_message(client, userdata, message):
-        try:
-            payload = json.loads(message.payload.decode())
-            message_received["payload"] = payload
-            message_received["received"] = True
-        except Exception:
-            message_received["payload"] = message.payload.decode()
-            message_received["received"] = True
 
     client = None
 
-    try:
-        client = mqtt.Client(client_id=client_id)
-        client.on_message = on_message
+    def on_connect(client, userdata, flags, rc, *extra):
+        # En MQTT 3.1.1, rc == 0 significa conexión exitosa.
+        try:
+            if hasattr(rc, "value"):
+                connection_code = rc.value
+            else:
+                connection_code = int(rc)
 
-        client.connect(broker, int(port), 60)
-        client.subscribe(topic)
+            if connection_code != 0:
+                result["error"] = (
+                    f"El broker rechazó la conexión. Código: "
+                    f"{connection_code}"
+                )
+                message_event.set()
+                return
+
+            client.subscribe(topic, qos=0)
+
+        except Exception as exc:
+            result["error"] = f"Error al suscribirse: {exc}"
+            message_event.set()
+
+    def on_subscribe(client, userdata, mid, granted_qos, *extra):
+        # La suscripción se confirma desde el callback.
+        pass
+
+    def on_message(client, userdata, message):
+        try:
+            raw_payload = message.payload.decode("utf-8")
+        except UnicodeDecodeError:
+            raw_payload = message.payload.decode(
+                "utf-8",
+                errors="replace"
+            )
+
+        try:
+            payload = json.loads(raw_payload)
+        except (json.JSONDecodeError, TypeError):
+            payload = raw_payload
+
+        result["payload"] = payload
+        result["received"] = True
+        message_event.set()
+
+    def on_disconnect(client, userdata, *args):
+        # Evita marcar como error una desconexión normal
+        # después de recibir el mensaje.
+        if not result["received"] and not result["error"]:
+            pass
+
+    try:
+        broker = broker.strip()
+        topic = topic.strip()
+        client_id = client_id.strip()
+
+        if not broker:
+            return {"error": "La dirección del broker está vacía."}
+
+        if not topic:
+            return {"error": "El tópico MQTT está vacío."}
+
+        if not client_id:
+            return {"error": "El ID del cliente está vacío."}
+
+        port = int(port)
+
+        if not 1 <= port <= 65535:
+            return {"error": "El puerto debe estar entre 1 y 65535."}
+
+        client = create_mqtt_client(client_id)
+
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.on_subscribe = on_subscribe
+        client.on_disconnect = on_disconnect
+
+        client.connect(broker, port, keepalive=30)
         client.loop_start()
 
-        timeout = time.time() + 5
+        # Espera la llegada del mensaje o un error de conexión.
+        message_event.wait(timeout)
 
-        while (
-            not message_received["received"]
-            and time.time() < timeout
-        ):
-            time.sleep(0.1)
+        if result["error"]:
+            return {"error": result["error"]}
 
-        client.loop_stop()
-        client.disconnect()
-
-        if not message_received["received"]:
+        if not result["received"]:
             return {
-                "error": "Tiempo de espera agotado. No se recibió ningún mensaje."
+                "error": (
+                    f"Tiempo de espera agotado ({timeout} segundos). "
+                    "No llegó ningún mensaje al tópico indicado. "
+                    "Verifica que otro dispositivo esté publicando "
+                    "datos en ese mismo tópico."
+                )
             }
 
-        return message_received["payload"]
+        return result["payload"]
 
-    except Exception as e:
+    except Exception as exc:
+        return {
+            "error": (
+                f"{type(exc).__name__}: {str(exc)}"
+            )
+        }
+
+    finally:
         if client is not None:
             try:
                 client.loop_stop()
-                client.disconnect()
             except Exception:
                 pass
 
-        return {"error": str(e)}
+            try:
+                client.disconnect()
+            except Exception:
+                pass
 
 
 # =========================================================
@@ -401,6 +492,7 @@ with st.sidebar:
         value=1883,
         min_value=1,
         max_value=65535,
+        step=1,
         help="Puerto del broker MQTT"
     )
 
@@ -413,7 +505,16 @@ with st.sidebar:
     client_id = st.text_input(
         "client_id",
         value="streamlit_client",
-        help="Identificador del cliente MQTT"
+        help="Identificador único del cliente MQTT"
+    )
+
+    timeout = st.number_input(
+        "timeout_seconds",
+        value=8,
+        min_value=1,
+        max_value=60,
+        step=1,
+        help="Tiempo máximo de espera por un mensaje"
     )
 
     st.markdown("---")
@@ -423,8 +524,9 @@ with st.sidebar:
         'font-size:12px;color:#8B949E;line-height:2;">'
         '<span style="color:#79C0FF;">PROTOCOL</span> MQTT<br>'
         '<span style="color:#79C0FF;">FORMAT</span> JSON / TEXT<br>'
-        '<span style="color:#79C0FF;">TIMEOUT</span> 5 seconds'
-        '</div>',
+        '<span style="color:#79C0FF;">TIMEOUT</span> '
+        + str(int(timeout)) + ' seconds'
+        + '</div>',
         unsafe_allow_html=True
     )
 
@@ -447,7 +549,7 @@ st.markdown("""
         <span class="syntax-purple">class</span>
         <span class="syntax-green"> SensorMonitor</span>:<br>
         &nbsp;&nbsp;&nbsp;&nbsp;<span class="syntax-blue">"""</span>
-        Receive and inspect live sensor messages.
+        Receive and inspect sensor messages.
         <span class="syntax-blue">"""</span><br>
         &nbsp;&nbsp;&nbsp;&nbsp;protocol = <span class="syntax-orange">"MQTT"</span><br>
         &nbsp;&nbsp;&nbsp;&nbsp;data_format = <span class="syntax-orange">"JSON / TEXT"</span>
@@ -472,7 +574,7 @@ with st.expander("README.md  |  Instrucciones de uso"):
     1. Define la dirección del broker.
     2. Selecciona el puerto MQTT.
     3. Introduce el tópico de suscripción.
-    4. Define un ID de cliente único.
+    4. Define un ID de cliente.
     5. Ejecuta la lectura para esperar un mensaje.
 
     **Brokers públicos de prueba**
@@ -481,8 +583,8 @@ with st.expander("README.md  |  Instrucciones de uso"):
     - `test.mosquitto.org`
     - `broker.hivemq.com`
 
-    Los brokers públicos pueden tener restricciones de acceso,
-    disponibilidad variable y tópicos compartidos con otros usuarios.
+    **Importante:** otro dispositivo debe publicar datos en el mismo tópico.
+    Conectarse al broker no garantiza que exista un mensaje disponible.
     """)
 
 
@@ -490,16 +592,21 @@ with st.expander("README.md  |  Instrucciones de uso"):
 # ESTADO DE CONEXIÓN
 # =========================================================
 
+# Escapar el contenido del usuario para evitar que caracteres
+# HTML en el broker o tópico rompan la interfaz.
+safe_broker = html.escape(str(broker))
+safe_topic = html.escape(str(topic))
+
 st.markdown(
     f"""
     <div class="status-bar">
         <span class="status-green">● READY</span>
         &nbsp; | &nbsp;
-        <span>HOST:</span> {broker}
+        <span>HOST:</span> {safe_broker}
         &nbsp; | &nbsp;
         <span>PORT:</span> {int(port)}
         &nbsp; | &nbsp;
-        <span>TOPIC:</span> {topic}
+        <span>TOPIC:</span> {safe_topic}
     </div>
     """,
     unsafe_allow_html=True
@@ -527,16 +634,25 @@ if st.button(
         st.session_state.sensor_data = {
             "error": "El broker, el tópico y el ID del cliente son obligatorios."
         }
+        st.session_state.last_read_time = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
     else:
-        with st.spinner("Conectando al broker MQTT y esperando datos..."):
+        with st.spinner(
+            "Conectando al broker MQTT y esperando datos..."
+        ):
             sensor_data = get_mqtt_message(
-                broker.strip(),
-                int(port),
-                topic.strip(),
-                client_id.strip()
+                broker=broker,
+                port=int(port),
+                topic=topic,
+                client_id=client_id,
+                timeout=int(timeout)
             )
 
             st.session_state.sensor_data = sensor_data
+            st.session_state.last_read_time = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
 
 
 # =========================================================
@@ -546,7 +662,6 @@ if st.button(
 if st.session_state.sensor_data is not None:
 
     st.markdown("---")
-
     st.markdown("### `02` — Output / Sensor data")
 
     data = st.session_state.sensor_data
@@ -557,7 +672,7 @@ if st.session_state.sensor_data is not None:
 
         st.markdown(
             '<div class="status-bar">'
-            '<span style="color:#F85149;">● ERROR</span>'
+            '<span class="status-red">● ERROR</span>'
             '&nbsp; | &nbsp; No se pudo completar la lectura.'
             '</div>',
             unsafe_allow_html=True
@@ -573,27 +688,44 @@ if st.session_state.sensor_data is not None:
             unsafe_allow_html=True
         )
 
+        if st.session_state.last_read_time:
+            st.caption(
+                "Timestamp: "
+                + st.session_state.last_read_time
+            )
+
         if isinstance(data, dict):
 
             st.markdown("#### `payload`")
 
-            # Limitar las columnas para mantener legibilidad
-            # cuando el mensaje contiene muchos campos.
             items = list(data.items())
+
+            if not items:
+                st.info(
+                    "El mensaje recibido es un objeto JSON vacío: {}"
+                )
 
             for start in range(0, len(items), 3):
                 group = items[start:start + 3]
                 cols = st.columns(len(group))
 
                 for col, (key, value) in zip(cols, group):
+                    if isinstance(value, (dict, list)):
+                        display_value = json.dumps(
+                            value,
+                            ensure_ascii=False
+                        )
+                    elif value is None:
+                        display_value = "null"
+                    elif isinstance(value, bool):
+                        display_value = str(value)
+                    else:
+                        display_value = str(value)
+
                     with col:
                         st.metric(
                             label=str(key),
-                            value=(
-                                json.dumps(value, ensure_ascii=False)
-                                if isinstance(value, (dict, list))
-                                else str(value)
-                            )
+                            value=display_value
                         )
 
             with st.expander("payload.json  |  JSON completo"):
@@ -604,7 +736,24 @@ if st.session_state.sensor_data is not None:
                     json.dumps(
                         data,
                         indent=4,
-                        ensure_ascii=False
+                        ensure_ascii=False,
+                        default=str
+                    ),
+                    language="json"
+                )
+
+        elif isinstance(data, list):
+
+            st.markdown("#### `payload.array`")
+            st.json(data)
+
+            with st.expander("payload.raw  |  Texto serializado"):
+                st.code(
+                    json.dumps(
+                        data,
+                        indent=4,
+                        ensure_ascii=False,
+                        default=str
                     ),
                     language="json"
                 )
@@ -621,7 +770,7 @@ if st.session_state.sensor_data is not None:
 
 st.markdown("""
 <div class="footer">
-    MQTT SENSOR READER // IOT DEBUGGING CONSOLE // v1.0
+    MQTT SENSOR READER // IOT DEBUGGING CONSOLE // v1.1
 </div>
 """, unsafe_allow_html=True)
 
